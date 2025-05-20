@@ -82,20 +82,63 @@ class Gr00tPolicy(BasePolicy):
             denoising_steps: Number of denoising steps to use for the action head.
             device (Union[int, str]): Device to run the model on.
         """
+        original_hf_repo_id = model_path # e.g., "willnorris/gr00t-6"
+        checkpoint_subfolder = "checkpoint-20000" # The specific checkpoint folder name
+        experiment_cfg_subfolder = "experiment_cfg" # The metadata folder name
+
         try:
             # NOTE(YL) this returns the local path to the model which is normally
             # saved in ~/.cache/huggingface/hub/
-            model_path = snapshot_download(model_path, repo_type="model")
-            # HFValidationError, RepositoryNotFoundError
-        except (HFValidationError, RepositoryNotFoundError):
-            print(
-                f"Model not found or avail in the huggingface hub. Loading from local path: {model_path}"
+            print(f"Downloading model files from {original_hf_repo_id} (patterns: ['{checkpoint_subfolder}/*', '{experiment_cfg_subfolder}/*'])")
+            # Download only the specific checkpoint and experiment_cfg folders.
+            # snapshot_root_path will be like /root/.cache/.../snapshots/<snapshot_id>
+            snapshot_root_path = snapshot_download(
+                original_hf_repo_id,
+                repo_type="model",
+                allow_patterns=[f"{checkpoint_subfolder}/*", f"{experiment_cfg_subfolder}/*"]
             )
+            print(f"Snapshot downloaded to: {snapshot_root_path}")
+
+            # The actual model weights and config.json are inside the checkpoint_subfolder
+            path_to_model_weights_and_config = Path(snapshot_root_path) / checkpoint_subfolder
+            
+            # The metadata.json is inside the experiment_cfg_subfolder
+            path_to_experiment_cfg = Path(snapshot_root_path) / experiment_cfg_subfolder
+
+            if not path_to_model_weights_and_config.is_dir():
+                raise FileNotFoundError(f"Checkpoint subfolder '{checkpoint_subfolder}' not found in snapshot at {snapshot_root_path}")
+            if not path_to_experiment_cfg.is_dir():
+                raise FileNotFoundError(f"Experiment config subfolder '{experiment_cfg_subfolder}' not found in snapshot at {snapshot_root_path}")
+
+        except (HFValidationError, RepositoryNotFoundError) as e:
+            print(
+                f"Model not found or download failed from Hugging Face Hub for {original_hf_repo_id}. Error: {e}. "
+                f"Attempting to load from local path assuming '{original_hf_repo_id}' is a local path."
+            )
+            # If download fails, assume original_hf_repo_id is a local path that ALREADY contains
+            # the checkpoint_subfolder and experiment_cfg_subfolder, or is the checkpoint folder itself.
+            # This part tries to preserve original behavior if model_path was a local path.
+            base_path = Path(original_hf_repo_id)
+            if (base_path / checkpoint_subfolder).is_dir(): # If model_path is a root containing checkpoint-20000
+                path_to_model_weights_and_config = base_path / checkpoint_subfolder
+                path_to_experiment_cfg = base_path / experiment_cfg_subfolder
+            else: # Assume model_path *is* the checkpoint-20000 folder
+                path_to_model_weights_and_config = base_path
+                # Try to find experiment_cfg relative to its parent, or at same level
+                if (base_path.parent / experiment_cfg_subfolder).is_dir():
+                    path_to_experiment_cfg = base_path.parent / experiment_cfg_subfolder
+                else: # Fallback: assume it's also in the model_path (less likely for separate experiment_cfg)
+                     path_to_experiment_cfg = base_path / experiment_cfg_subfolder
+
 
         self._modality_config = modality_config
         self._modality_transform = modality_transform
         self._modality_transform.eval()  # set this to eval mode
-        self.model_path = Path(model_path)
+        
+        # self.model_path is used by _load_metadata in the original code, but we pass the direct path now.
+        # For consistency, let it hold the path to where config.json is, or the snapshot root.
+        # Let's set it to the path containing the model weights and config for clarity.
+        self.model_path = path_to_model_weights_and_config 
         self.device = device
 
         # Convert string embodiment tag to EmbodimentTag enum if needed
@@ -104,10 +147,12 @@ class Gr00tPolicy(BasePolicy):
         else:
             self.embodiment_tag = embodiment_tag
 
-        # Load model
-        self._load_model(model_path)
-        # Load transforms
-        self._load_metadata(self.model_path / "experiment_cfg")
+        # Load model using the direct path to where config.json and weights are
+        self._load_model(str(path_to_model_weights_and_config))
+        
+        # Load transforms using the direct path to experiment_cfg
+        self._load_metadata(path_to_experiment_cfg)
+        
         # Load horizons
         self._load_horizons()
 
